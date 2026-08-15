@@ -375,7 +375,8 @@ app.all('*', async (req, res) => {
       if (!botToken || !appId) return res.status(400).set(corsHeaders).json({ error: "Missing botToken or appId" });
       const response = await registerSlashCommands(botToken, appId, guildId || "");
       const text = await response.text();
-      return res.status(response.status).set(corsHeaders).send(text);
+      // SE AGREGÓ: .type("json")
+      return res.status(response.status).set(corsHeaders).type("json").send(text);
     }
 
     if (urlPath.endsWith("/verify") && req.method === "POST") {
@@ -398,7 +399,8 @@ app.all('*', async (req, res) => {
 
       const response = await handleDiscordInteraction(body);
       const text = await response.text();
-      return res.status(response.status).set(corsHeaders).send(text);
+      // SE AGREGÓ: .type("json")
+      return res.status(response.status).set(corsHeaders).type("json").send(text);
     }
 
     return res.status(200).set(corsHeaders).json({ status: "ok", bot: "CryptoVerify Discord Bot (Node.js)" });
