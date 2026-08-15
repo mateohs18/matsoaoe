@@ -1,4 +1,6 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import { createClient } from "@supabase/supabase-js";
+import express from "express";
+import { webcrypto } from "node:crypto";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -6,14 +8,14 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-// Inicialización "Lazy" del cliente de Supabase para evitar BOOT_ERROR
+// Inicialización "Lazy" del cliente de Supabase
 let supabaseInstance: any = null;
 function getSupabase() {
   if (!supabaseInstance) {
-    const url = Deno.env.get("SUPABASE_URL");
-    const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!url || !key) {
-      throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables. Configure them in Supabase.");
+      throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.");
     }
     supabaseInstance = createClient(url, key);
   }
@@ -106,37 +108,31 @@ function detectNetwork(txHash: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Core verification logic (shared by Discord and dashboard)
+// Core verification logic
 // ---------------------------------------------------------------------------
 
 async function verifyTransaction(txHash: string, username: string, discordUserId?: string, discordUsername?: string) {
   const supabase = getSupabase();
 
-  // Duplicate check
-  const { data: existingTx } = await supabase
-    .from("transactions").select("*").eq("tx_hash", txHash).maybeSingle();
+  const { data: existingTx } = await supabase.from("transactions").select("*").eq("tx_hash", txHash).maybeSingle();
   if (existingTx && existingTx.status === "confirmed") {
     return { error: "This transaction was already verified — credits were already added.", status: 409 };
   }
 
-  // Settings
   const { data: settingsData } = await supabase.from("settings").select("*");
   const settings: Record<string, string> = {};
   (settingsData || []).forEach((s: any) => { settings[s.key] = s.value; });
   const creditsPerUsd = parseFloat(settings["credits_per_usd"] || "1");
 
-  // Wallets — check against ALL configured wallet addresses
   const { data: walletsData } = await supabase.from("wallets").select("*");
   const validWallets: { name: string; address: string }[] = (walletsData || [])
     .filter((w: any) => w.address && w.address.trim().length > 0)
     .map((w: any) => ({ name: w.name, address: w.address.trim() }));
 
-  // API keys
   const { data: apiKeysData } = await supabase.from("api_keys").select("*");
   const apiKeys: Record<string, string> = {};
   (apiKeysData || []).forEach((k: any) => { apiKeys[k.key_name] = k.key_value; });
 
-  // Fetch from blockchain
   let txData: BlockchainTransaction | null = null;
   const detectedNetwork = detectNetwork(txHash);
 
@@ -156,7 +152,6 @@ async function verifyTransaction(txHash: string, username: string, discordUserId
     return { error: "Could not find this transaction on the blockchain. Check the TX ID and try again.", status: 404 };
   }
 
-  // USD price
   const sym = txData.tokenSymbol.toUpperCase();
   if (sym === "USDT" || sym === "USDC") {
     txData.usdValue = txData.amount;
@@ -165,11 +160,8 @@ async function verifyTransaction(txHash: string, username: string, discordUserId
     txData.usdValue = txData.amount * price;
   }
 
-  // Receiver check — match against any configured wallet
   if (validWallets.length > 0 && txData.to) {
-    const matchedWallet = validWallets.find(
-      (w) => w.address.toLowerCase() === txData.to.toLowerCase()
-    );
+    const matchedWallet = validWallets.find((w) => w.address.toLowerCase() === txData.to.toLowerCase());
     if (!matchedWallet) {
       await supabase.from("transactions").upsert({
         tx_hash: txHash, username, discord_user_id: discordUserId, discord_username: discordUsername,
@@ -200,7 +192,6 @@ async function verifyTransaction(txHash: string, username: string, discordUserId
     return { error: "Payment amount is too small to add any credits.", status: 400 };
   }
 
-  // Find or create user
   let user = null;
   if (discordUserId) {
     const { data } = await supabase.from("users").select("*").eq("discord_user_id", discordUserId).maybeSingle();
@@ -218,7 +209,6 @@ async function verifyTransaction(txHash: string, username: string, discordUserId
   }
   if (!user) return { error: "Failed to find or create user.", status: 500 };
 
-  // Update discord info if missing
   const updates: Record<string, string> = {};
   if (discordUserId && !user.discord_user_id) updates.discord_user_id = discordUserId;
   if (discordUsername && !user.discord_username) updates.discord_username = discordUsername;
@@ -250,7 +240,7 @@ async function verifyTransaction(txHash: string, username: string, discordUserId
 
 async function verifyDiscordSignature(body: string, signature: string, timestamp: string, publicKey: string): Promise<boolean> {
   try {
-    const key = await crypto.subtle.importKey(
+    const key = await webcrypto.subtle.importKey(
       "raw",
       hexToUint8(publicKey),
       { name: "Ed25519", namedCurve: "Ed25519" },
@@ -259,8 +249,9 @@ async function verifyDiscordSignature(body: string, signature: string, timestamp
     );
     const message = new TextEncoder().encode(timestamp + body);
     const sigBytes = hexToUint8(signature);
-    return await crypto.subtle.verify("Ed25519", key, sigBytes, message);
-  } catch {
+    return await webcrypto.subtle.verify("Ed25519", key, sigBytes, message);
+  } catch (err) {
+    console.error("Signature verification error:", err);
     return false;
   }
 }
@@ -279,53 +270,26 @@ function hexToUint8(hex: string): Uint8Array {
 
 async function registerSlashCommands(botToken: string, appId: string, guildId: string): Promise<Response> {
   const commands = [
-    {
-      name: "verify",
-      description: "Verify a crypto payment and add credits to your account",
-      options: [{
-        name: "txid",
-        description: "The transaction ID (TX hash) from Binance or your crypto app",
-        type: 3,
-        required: true,
-      }],
-    },
-    {
-      name: "balance",
-      description: "Check your current credit balance",
-    },
-    {
-      name: "wallets",
-      description: "Show the available wallet addresses for payments",
-    },
-    {
-      name: "help",
-      description: "Show how to use the bot",
-    },
+    { name: "verify", description: "Verify a crypto payment and add credits", options: [{ name: "txid", description: "The transaction ID", type: 3, required: true }] },
+    { name: "balance", description: "Check your current credit balance" },
+    { name: "wallets", description: "Show available wallet addresses" },
+    { name: "help", description: "Show how to use the bot" },
   ];
 
-  const url = guildId
-    ? `https://discord.com/api/v10/applications/${appId}/guilds/${guildId}/commands`
-    : `https://discord.com/api/v10/applications/${appId}/commands`;
+  const url = guildId ? `https://discord.com/api/v10/applications/${appId}/guilds/${guildId}/commands` : `https://discord.com/api/v10/applications/${appId}/commands`;
 
   const response = await fetch(url, {
     method: "PUT",
-    headers: {
-      Authorization: `Bot ${botToken}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(commands),
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    return new Response(JSON.stringify({ error: `Discord API error: ${response.status}`, detail: errText }), {
-      status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(JSON.stringify({ error: `Discord API error: ${response.status}`, detail: errText }), { status: 502 });
   }
 
-  return new Response(JSON.stringify({ success: true, message: "Slash commands registered successfully." }), {
-    status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+  return new Response(JSON.stringify({ success: true, message: "Commands registered successfully." }), { status: 200 });
 }
 
 // ---------------------------------------------------------------------------
@@ -337,12 +301,8 @@ async function handleDiscordInteraction(body: any): Promise<Response> {
   const discordUser = body.member?.user ?? body.user;
   const supabase = getSupabase();
 
-  // PING (type 1) — must respond with type 1
-  if (interactionType === 1) {
-    return jsonResponse({ type: 1 });
-  }
+  if (interactionType === 1) return jsonResponse({ type: 1 });
 
-  // APPLICATION_COMMAND (type 2)
   if (interactionType === 2) {
     const commandName = body.data?.name;
     const username = discordUser?.username ?? "unknown";
@@ -350,217 +310,105 @@ async function handleDiscordInteraction(body: any): Promise<Response> {
 
     if (commandName === "help") {
       return jsonResponse({
-        type: 4,
-        data: {
-          embeds: [{
-            title: "CryptoVerify Bot — Help",
-            description: "Verify crypto payments and get credits automatically (1 USD = 1 credit).",
-            color: 0x06b6d4,
-            fields: [
-              { name: "/wallets", value: "Show the available wallet addresses to send payments to." },
-              { name: "/verify `txid`", value: "Paste a transaction ID from Binance or any crypto app. The bot checks the blockchain and adds credits if confirmed." },
-              { name: "/balance", value: "Check your current credit balance." },
-              { name: "/help", value: "Show this help message." },
-            ],
-            footer: { text: "Supports TRON (TRC20), Ethereum (ERC20), and BSC (BEP20)" },
-          }],
-        },
+        type: 4, data: { embeds: [{ title: "CryptoVerify Bot", description: "Use /verify <txid> to get credits.", color: 0x06b6d4 }] }
       });
     }
 
     if (commandName === "wallets") {
       const { data: walletsData } = await supabase.from("wallets").select("*");
-      
-      const validWallets = (walletsData || [])
-        .filter((w: any) => w.address && w.address.trim().length > 0)
-        .map((w: any) => {
-          // Detectar la red automáticamente según el prefijo si no viene explícita
-          const net = w.network || (w.address.startsWith("T") ? "TRON (TRC20)" : w.address.startsWith("0x") ? "Ethereum / BSC (ERC20/BEP20)" : "Crypto");
-          return {
-            name: `💳 ${w.name || "Wallet"}`,
-            value: `🌐 Network: **${net}**\n\`${w.address.trim()}\``,
-            inline: false,
-          };
-        });
-
-      if (validWallets.length === 0) {
-        return jsonResponse({
-          type: 4,
-          data: {
-            embeds: [{
-              title: "Payment Wallets",
-              description: "There are currently no payment addresses configured.",
-              color: 0x64748b,
-            }],
-          },
-        });
-      }
-
-      return jsonResponse({
-        type: 4,
-        data: {
-          embeds: [{
-            title: "Payment Wallets",
-            description: "Send your cryptocurrency payments to the corresponding network address below. Once sent, use `/verify <txid>` to get your credits.",
-            color: 0x3b82f6,
-            fields: validWallets,
-          }],
-        },
-      });
+      const validWallets = (walletsData || []).filter((w: any) => w.address).map((w: any) => ({
+        name: `💳 ${w.name || "Wallet"}`, value: `\`${w.address.trim()}\``, inline: false,
+      }));
+      return jsonResponse({ type: 4, data: { embeds: [{ title: "Payment Wallets", color: 0x3b82f6, fields: validWallets.length ? validWallets : [{name:"Error", value:"No wallets set"}] }] } });
     }
 
     if (commandName === "balance") {
-      let user = null;
-      if (discordUserId) {
-        const { data } = await supabase.from("users").select("*").eq("discord_user_id", discordUserId).maybeSingle();
-        user = data;
-      }
-      if (!user) {
-        const { data } = await supabase.from("users").select("*").eq("username", username).maybeSingle();
-        user = data;
-      }
-
-      const credits = user?.credits ?? 0;
-      return jsonResponse({
-        type: 4,
-        data: {
-          embeds: [{
-            title: "Credit Balance",
-            description: user
-              ? `You currently have **${credits} credits**.`
-              : `You don't have an account yet. Use \`/verify\` to make your first payment and create one automatically.`,
-            color: credits > 0 ? 0x10b981 : 0x64748b,
-          }],
-        },
-      });
+      const { data: user } = await supabase.from("users").select("*").eq("discord_user_id", discordUserId).maybeSingle();
+      return jsonResponse({ type: 4, data: { embeds: [{ title: "Balance", description: `You have **${user?.credits ?? 0}** credits.`, color: 0x10b981 }] } });
     }
 
     if (commandName === "verify") {
       const txHash = body.data?.options?.find((o: any) => o.name === "txid")?.value;
-      if (!txHash) {
-        return jsonResponse({
-          type: 4,
-          data: { content: "Please provide a transaction ID. Usage: `/verify txid:<your-tx-id>`" },
-        });
-      }
-
+      if (!txHash) return jsonResponse({ type: 4, data: { content: "Please provide a TXID." } });
       const result = await verifyTransaction(txHash, username, discordUserId, username);
-
       if (result.success) {
-        const td = result.txData as BlockchainTransaction;
-        return jsonResponse({
-          type: 4,
-          data: {
-            embeds: [{
-              title: "Payment Confirmed",
-              description: result.message,
-              color: 0x10b981,
-              fields: [
-                { name: "Amount", value: `${td.amount} ${td.tokenSymbol}`, inline: true },
-                { name: "USD Value", value: `$${(result.usdValue ?? 0).toFixed(2)}`, inline: true },
-                { name: "Credits Added", value: `+${result.creditsAdded}`, inline: true },
-                { name: "Network", value: td.network, inline: true },
-                { name: "New Balance", value: `${result.user?.credits ?? 0} credits`, inline: true },
-                { name: "Wallet", value: td.receiverWallet || "Any", inline: true },
-                { name: "TX Hash", value: `\`${txHash.slice(0, 20)}...\`` },
-              ],
-              footer: { text: "Payment verified on-chain" },
-            }],
-          },
-        });
+        return jsonResponse({ type: 4, data: { embeds: [{ title: "Payment Confirmed", description: `+${result.creditsAdded} credits added!`, color: 0x10b981 }] } });
       } else {
-        const color = result.status === 202 ? 0xf59e0b : 0xef4444;
-        return jsonResponse({
-          type: 4,
-          data: {
-            embeds: [{
-              title: result.status === 202 ? "Payment Pending" : "Verification Failed",
-              description: result.error,
-              color,
-            }],
-          },
-        });
+        return jsonResponse({ type: 4, data: { embeds: [{ title: "Failed", description: result.error, color: 0xef4444 }] } });
       }
     }
   }
-
   return jsonResponse({ type: 4, data: { content: "Unknown command." } });
 }
 
 function jsonResponse(data: any): Response {
-  return new Response(JSON.stringify(data), {
-    status: 200,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+  return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 // ---------------------------------------------------------------------------
-// Main handler
+// Main Node.js Express Server
 // ---------------------------------------------------------------------------
 
-Deno.serve(async (req: Request) => {
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Parseamos todo como texto primero para poder validar la firma de Discord
+app.use(express.text({ type: '*/*' }));
+
+app.all('*', async (req, res) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
+    return res.status(200).set(corsHeaders).end();
   }
 
   try {
     const supabase = getSupabase();
+    const urlPath = req.path;
+    const rawBody = typeof req.body === 'string' ? req.body : "";
+    let body: any = {};
     
-    // Setup route: POST /setup to register slash commands
-    const url = new URL(req.url);
-    if (url.pathname.endsWith("/setup") && req.method === "POST") {
-      const body = await req.json();
+    if (rawBody) {
+      try { body = JSON.parse(rawBody); } catch (e) { /* Ignore parse error */ }
+    }
+
+    if (urlPath.endsWith("/setup") && req.method === "POST") {
       const { botToken, appId, guildId } = body;
-      if (!botToken || !appId) {
-        return new Response(JSON.stringify({ error: "Bot token and App ID are required" }), {
-          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      return await registerSlashCommands(botToken, appId, guildId || "");
+      if (!botToken || !appId) return res.status(400).set(corsHeaders).json({ error: "Missing botToken or appId" });
+      const response = await registerSlashCommands(botToken, appId, guildId || "");
+      const text = await response.text();
+      return res.status(response.status).set(corsHeaders).send(text);
     }
 
-    // Manual verify route: POST /verify (used by dashboard)
-    if (url.pathname.endsWith("/verify") && req.method === "POST") {
-      const body = await req.json();
+    if (urlPath.endsWith("/verify") && req.method === "POST") {
       const result = await verifyTransaction(body.txHash, body.username);
-      return new Response(JSON.stringify(result), {
-        status: (result as any).status ?? 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return res.status((result as any).status ?? 200).set(corsHeaders).json(result);
     }
 
-    // Discord interaction (POST to base URL)
     if (req.method === "POST") {
-      const rawBody = await req.text();
-      const body = JSON.parse(rawBody);
-
-      // Verify Discord signature if public key is configured
-      const { data: pubKeySetting } = await supabase
-        .from("settings").select("value").eq("key", "discord_public_key").maybeSingle();
+      const { data: pubKeySetting } = await supabase.from("settings").select("value").eq("key", "discord_public_key").maybeSingle();
       const publicKey = pubKeySetting?.value || "";
 
       if (publicKey) {
-        const signature = req.headers.get("x-signature-ed25519") || "";
-        const timestamp = req.headers.get("x-signature-timestamp") || "";
+        const signature = req.headers["x-signature-ed25519"] as string || "";
+        const timestamp = req.headers["x-signature-timestamp"] as string || "";
         const valid = await verifyDiscordSignature(rawBody, signature, timestamp, publicKey);
         if (!valid) {
-          return new Response(JSON.stringify({ error: "Invalid request signature" }), {
-            status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
+          return res.status(401).set(corsHeaders).json({ error: "Invalid request signature" });
         }
       }
 
-      return await handleDiscordInteraction(body);
+      const response = await handleDiscordInteraction(body);
+      const text = await response.text();
+      return res.status(response.status).set(corsHeaders).send(text);
     }
 
-    // GET — health check
-    return new Response(JSON.stringify({ status: "ok", bot: "CryptoVerify Discord Bot" }), {
-      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return res.status(200).set(corsHeaders).json({ status: "ok", bot: "CryptoVerify Discord Bot (Node.js)" });
+
   } catch (err: any) {
     console.error("Main handler error:", err);
-    return new Response(JSON.stringify({ error: err.message || "Internal server error" }), {
-      status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return res.status(500).set(corsHeaders).json({ error: err.message || "Internal server error" });
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`Bot server running on port ${PORT}`);
 });
