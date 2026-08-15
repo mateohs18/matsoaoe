@@ -8,7 +8,7 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-// Inicialización "Lazy" del cliente de Supabase
+// Lazy initialization of the Supabase client
 let supabaseInstance: any = null;
 function getSupabase() {
   if (!supabaseInstance) {
@@ -310,21 +310,42 @@ async function handleDiscordInteraction(body: any): Promise<Response> {
 
     if (commandName === "help") {
       return jsonResponse({
-        type: 4, data: { embeds: [{ title: "CryptoVerify Bot", description: "Use /verify <txid> to get credits.", color: 0x06b6d4 }] }
+        type: 4, data: { embeds: [{ title: "CryptoVerify Bot", description: "Use `/verify <txid>` to get credits.", color: 0x06b6d4 }] }
       });
     }
 
     if (commandName === "wallets") {
       const { data: walletsData } = await supabase.from("wallets").select("*");
-      const validWallets = (walletsData || []).filter((w: any) => w.address).map((w: any) => ({
-        name: `💳 ${w.name || "Wallet"}`, value: `\`${w.address.trim()}\``, inline: false,
-      }));
-      return jsonResponse({ type: 4, data: { embeds: [{ title: "Payment Wallets", color: 0x3b82f6, fields: validWallets.length ? validWallets : [{name:"Error", value:"No wallets set"}] }] } });
+      
+      const validWallets = (walletsData || [])
+        .filter((w: any) => w.address && w.address.trim().length > 0)
+        .map((w: any) => {
+          // Detect network automatically based on prefix
+          const net = w.network || (w.address.startsWith("T") ? "TRON (TRC20)" : w.address.startsWith("0x") ? "Ethereum / BSC (ERC20/BEP20)" : "Unknown");
+          
+          return {
+            name: `💳 ${w.name || "Wallet"}`,
+            value: `🌐 Network: **${net}**\n\`\`\`\n${w.address.trim()}\n\`\`\``,
+            inline: false,
+          };
+        });
+
+      return jsonResponse({ 
+        type: 4, 
+        data: { 
+          embeds: [{ 
+            title: "Payment Wallets", 
+            description: "Send your payment to the corresponding network. Hover over the address to copy it.",
+            color: 0x3b82f6, 
+            fields: validWallets.length ? validWallets : [{name: "Error", value: "No wallets set"}] 
+          }] 
+        } 
+      });
     }
 
     if (commandName === "balance") {
       const { data: user } = await supabase.from("users").select("*").eq("discord_user_id", discordUserId).maybeSingle();
-      return jsonResponse({ type: 4, data: { embeds: [{ title: "Balance", description: `You have **${user?.credits ?? 0}** credits.`, color: 0x10b981 }] } });
+      return jsonResponse({ type: 4, data: { embeds: [{ title: "Balance", description: `You currently have **${user?.credits ?? 0}** credits.`, color: 0x10b981 }] } });
     }
 
     if (commandName === "verify") {
@@ -334,7 +355,7 @@ async function handleDiscordInteraction(body: any): Promise<Response> {
       if (result.success) {
         return jsonResponse({ type: 4, data: { embeds: [{ title: "Payment Confirmed", description: `+${result.creditsAdded} credits added!`, color: 0x10b981 }] } });
       } else {
-        return jsonResponse({ type: 4, data: { embeds: [{ title: "Failed", description: result.error, color: 0xef4444 }] } });
+        return jsonResponse({ type: 4, data: { embeds: [{ title: "Verification Failed", description: result.error, color: 0xef4444 }] } });
       }
     }
   }
@@ -352,7 +373,7 @@ function jsonResponse(data: any): Response {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Parseamos todo como texto primero para poder validar la firma de Discord
+// Parse all as text first to validate Discord signature
 app.use(express.text({ type: '*/*' }));
 
 app.all('*', async (req, res) => {
@@ -375,7 +396,6 @@ app.all('*', async (req, res) => {
       if (!botToken || !appId) return res.status(400).set(corsHeaders).json({ error: "Missing botToken or appId" });
       const response = await registerSlashCommands(botToken, appId, guildId || "");
       const text = await response.text();
-      // SE AGREGÓ: .type("json")
       return res.status(response.status).set(corsHeaders).type("json").send(text);
     }
 
@@ -399,7 +419,6 @@ app.all('*', async (req, res) => {
 
       const response = await handleDiscordInteraction(body);
       const text = await response.text();
-      // SE AGREGÓ: .type("json")
       return res.status(response.status).set(corsHeaders).type("json").send(text);
     }
 
